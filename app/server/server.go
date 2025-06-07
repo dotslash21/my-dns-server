@@ -15,89 +15,111 @@ import (
 
 // Server represents a DNS server
 type Server struct {
-	listener    net.Listener
-	connections sync.Map
-	shutdown    chan struct{}
-	waitGroup   sync.WaitGroup
+	packetConn net.PacketConn
+	shutdown   chan struct{}
+	waitGroup  sync.WaitGroup
 }
 
+// NewServer creates a new DNS server instance
 func NewServer(port int) (*Server, error) {
-	listener, err := net.Listen("udp", fmt.Sprintf("0.0.0.0:%d", port))
+	address := fmt.Sprintf(":%d", port)
+	log.Printf("INFO: Creating new DNS server on port %d", port)
+
+	packetConn, err := net.ListenPacket("udp", address)
 	if err != nil {
+		log.Printf("ERROR: Failed to bind to port %d: %v", port, err)
 		return nil, errors.Wrap(err, errors.ErrorTypeServer, fmt.Sprintf("failed to bind to port %d", port))
 	}
 
 	s := &Server{
-		listener: listener,
-		shutdown: make(chan struct{}),
+		packetConn: packetConn,
+		shutdown:   make(chan struct{}),
 	}
 
+	log.Printf("INFO: DNS server created successfully")
 	return s, nil
 }
 
-// Run starts the server and listens for connections
+// Run starts the server and listens for incoming DNS packets
 func (s *Server) Run() error {
 	// Setup signal handling for graceful shutdown
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
 
+	log.Printf("INFO: Starting DNS server")
 	// Start accepting connections
-	go s.acceptConnections()
+	go s.listenForPackets()
 
 	// Wait for the shutdown signal
 	<-sigChan
+	log.Println("INFO: Shutdown signal received")
 	return s.Shutdown()
 }
 
-// acceptConnections accepts incoming connections
-func (s *Server) acceptConnections() {
+// listenForPackets accepts incoming connections
+func (s *Server) listenForPackets() {
+	// DNS typically uses packets up to 512 bytes, but can be larger with EDNS.
+	// A buffer of 1500 (common MTU) or 4096 should be safe.
+	buffer := make([]byte, 4096)
+
+	log.Printf("INFO: Listening for incoming packets")
+
 	for {
 		select {
 		case <-s.shutdown:
 			return
 		default:
-			conn, err := s.listener.Accept()
+			n, addr, err := s.packetConn.ReadFrom(buffer)
 			if err != nil {
-				log.Printf("Failed to accept connection: %v", err)
+				// Check if the error is due to the connection being closed during shutdown
+				select {
+				case <-s.shutdown:
+					log.Println("DEBUG: Packet listener stopped due to shutdown")
+					return
+				default:
+				}
+				// For other errors, log and continue
+				log.Printf("WARN: Failed to read packet: %v", err)
 				continue
 			}
 
+			// Handle the received packet
 			s.waitGroup.Add(1)
-			s.connections.Store(conn.RemoteAddr(), conn)
+			request := make([]byte, n)
+			copy(request, buffer[:n])
+			log.Printf("DEBUG: Dispatching packet from %s for handling", addr)
+			go s.handlePacket(request, addr)
 		}
 	}
 }
 
-// handleConnection handles a client connection
-func (s *Server) handleConnection(conn net.Conn) {
-	defer func() {
-		// Cleanup
-		err := conn.Close()
-		if err != nil {
-			log.Printf("Failed to close connection: %v", err)
-		}
-		s.connections.Delete(conn.RemoteAddr())
-		s.waitGroup.Done()
-	}()
+// handlePacket processes a single DNS packet
+func (s *Server) handlePacket(bytes []byte, addr net.Addr) {
+	defer s.waitGroup.Done()
 
-	// TODO: Logic to handle incoming connection later
+	log.Printf("DEBUG: Processing packet from %s", addr)
+	log.Printf("DEBUG: Packet contents: %s", bytes)
 }
 
 // Shutdown gracefully shuts down the server
 func (s *Server) Shutdown() error {
-	// Signal shutdown
+	log.Println("INFO: Initiating server shutdown")
+
+	// Signal all goroutines to stop
 	close(s.shutdown)
 
-	// Close listener to stop accepting new connections
-	if err := s.listener.Close(); err != nil {
-		return errors.Wrap(err, errors.ErrorTypeServer, "failed to close listener")
+	// Close the packet connection. This will unblock ReadFrom in listenForPackets.
+	if s.packetConn != nil {
+		if err := s.packetConn.Close(); err != nil {
+			// Log the error but continue shutdown, as we still want to wait for goroutines.
+			log.Printf("ERROR: Failed to close packet connection: %v", err)
+		}
 	}
 
-	// Create context with timeout for graceful shutdown
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	// Wait for all packet handlers to complete, with a timeout
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second) // Increased timeout slightly
 	defer cancel()
 
-	// Wait for all connections to close or timeout
 	done := make(chan struct{})
 	go func() {
 		s.waitGroup.Wait()
@@ -106,9 +128,10 @@ func (s *Server) Shutdown() error {
 
 	select {
 	case <-done:
-		log.Printf("Server shutdown complete")
+		log.Println("INFO: All active handlers finished. Server shutdown complete")
 	case <-ctx.Done():
-		log.Printf("Server shutdown timed out")
+		log.Printf("ERROR: Server shutdown timed out waiting for handlers")
+		return fmt.Errorf("server shutdown timed out") // Indicate timeout as an error
 	}
 
 	return nil
